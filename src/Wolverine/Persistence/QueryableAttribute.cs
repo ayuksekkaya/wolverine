@@ -53,11 +53,26 @@ namespace Wolverine.Persistence;
 /// </para>
 /// </remarks>
 [AttributeUsage(AttributeTargets.Parameter)]
-public class QueryableAttribute : WolverineParameterAttribute
+public class QueryableAttribute : WolverineParameterAttribute, IEntityLoadAttribute
 {
     public QueryableAttribute()
     {
         ValueSource = ValueSource.Anything;
+    }
+
+    public Type? DetermineLoadedEntityType(ParameterInfo parameter) => tryDetermineElementType(parameter);
+
+    private static Type? tryDetermineElementType(ParameterInfo parameter)
+    {
+        try
+        {
+            return DetermineElementType(parameter);
+        }
+        catch (InvalidOperationException)
+        {
+            // Modify() reports the unsupported parameter shape at codegen
+            return null;
+        }
     }
 
     public override Variable Modify(IChain chain, ParameterInfo parameter, IServiceContainer container,

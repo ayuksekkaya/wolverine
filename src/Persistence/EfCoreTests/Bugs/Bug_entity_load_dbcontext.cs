@@ -45,7 +45,13 @@ public class Bug_entity_load_dbcontext : IAsyncLifetime
                     .IncludeType(typeof(AuditEntityLoadNoteHandler))
                     .IncludeType(typeof(CountAllEntityLoadItemsHandler))
                     .IncludeType(typeof(CountQueryableEntityLoadItemsHandler))
-                    .IncludeType(typeof(FindFirstEntityLoadItemHandler));
+                    .IncludeType(typeof(FindFirstEntityLoadItemHandler))
+                    .IncludeType(typeof(RenameAllEntityLoadNotesHandler))
+                    .IncludeType(typeof(RenameFirstEntityLoadNoteHandler))
+                    .IncludeType(typeof(RenameQueryableEntityLoadNotesHandler))
+                    .IncludeType(typeof(AdminRenameAllEntityLoadItemsHandler))
+                    .IncludeType(typeof(RenameSpecifiedEntityLoadItemsHandler))
+                    .IncludeType(typeof(RenameLoadedPlanEntityLoadItemsHandler));
 
                 // Registered first, so it is the default DbContext for EntityLoadItem
                 opts.Services.AddDbContextWithWolverineIntegration<EntityLoadMainDbContext>(x =>
@@ -217,6 +223,86 @@ public class Bug_entity_load_dbcontext : IAsyncLifetime
         count.Count.ShouldBe(1);
     }
 
+    // Reading through a DbContext with [All], [FirstOrDefault], [Queryable] or a query plan makes the chain depend
+    // on that DbContext, exactly as taking it as a parameter would, so what the handler changes is saved
+
+    private static async Task<Guid> insertNote()
+    {
+        var id = Guid.NewGuid();
+        await execute($"INSERT INTO entity_load.notes (Id, Name) VALUES ('{id}', 'original')");
+        return id;
+    }
+
+    [Fact]
+    public async Task changes_to_all_are_saved()
+    {
+        var first = await insertNote();
+        var second = await insertNote();
+
+        await _host.TrackActivity().Timeout(30.Seconds()).InvokeMessageAndWaitAsync(new RenameAllEntityLoadNotes());
+
+        (await storedName("notes", first)).ShouldBe("renamed");
+        (await storedName("notes", second)).ShouldBe("renamed");
+    }
+
+    [Fact]
+    public async Task changes_to_first_or_default_are_saved()
+    {
+        var id = await insertNote();
+
+        await _host.TrackActivity().Timeout(30.Seconds()).InvokeMessageAndWaitAsync(new RenameFirstEntityLoadNote());
+
+        (await storedName("notes", id)).ShouldBe("renamed");
+    }
+
+    [Fact]
+    public async Task changes_to_queryable_results_are_saved()
+    {
+        var first = await insertNote();
+        var second = await insertNote();
+
+        await _host.TrackActivity().Timeout(30.Seconds()).InvokeMessageAndWaitAsync(new RenameQueryableEntityLoadNotes());
+
+        (await storedName("notes", first)).ShouldBe("renamed");
+        (await storedName("notes", second)).ShouldBe("renamed");
+    }
+
+    [Fact]
+    public async Task all_honors_a_designated_dbcontext_that_is_not_injected()
+    {
+        var alice = await insertItem("alice");
+        var bob = await insertItem("bob");
+
+        await _host.TrackActivity().Timeout(30.Seconds()).InvokeMessageAndWaitAsync(new AdminRenameAllEntityLoadItems());
+
+        (await storedName("items", alice)).ShouldBe("renamed");
+        (await storedName("items", bob)).ShouldBe("renamed");
+    }
+
+    [Fact]
+    public async Task changes_to_a_query_specification_are_saved_through_the_dbcontext_the_plan_names()
+    {
+        var alice = await insertItem("alice");
+        var bob = await insertItem("bob");
+
+        await _host.TrackActivity().Timeout(30.Seconds()).InvokeMessageAndWaitAsync(new RenameSpecifiedEntityLoadItems());
+
+        (await storedName("items", alice)).ShouldBe("renamed");
+        (await storedName("items", bob)).ShouldBe("renamed");
+    }
+
+    [Fact]
+    public async Task changes_to_a_query_plan_returned_by_load_are_saved()
+    {
+        var alice = await insertItem("alice");
+        var bob = await insertItem("bob");
+
+        await _host.TrackActivity().Timeout(30.Seconds()).InvokeMessageAndWaitAsync(new RenameLoadedPlanEntityLoadItems());
+
+        (await storedName("items", alice)).ShouldBe("renamed");
+        (await storedName("items", bob)).ShouldBe("renamed");
+    }
+
     [Fact]
     public async Task a_storage_update_is_applied_to_the_designated_dbcontext()
     {
@@ -339,6 +425,24 @@ public record FindFirstEntityLoadItem;
 
 public record EntityLoadItemCount(int Count);
 
+public record RenameAllEntityLoadNotes;
+
+public record RenameFirstEntityLoadNote;
+
+public record RenameQueryableEntityLoadNotes;
+
+public record AdminRenameAllEntityLoadItems;
+
+public record RenameSpecifiedEntityLoadItems;
+
+public record RenameLoadedPlanEntityLoadItems;
+
+// Names the admin DbContext, which sees every item
+public class AllEntityLoadItemsPlan : QueryListPlan<EntityLoadAdminDbContext, EntityLoadItem>
+{
+    public override IQueryable<EntityLoadItem> Query(EntityLoadAdminDbContext dbContext) => dbContext.Set<EntityLoadItem>();
+}
+
 public record RenameEntityLoadItem(Guid Id, string Name);
 
 public record AdminRenameEntityLoadItem(Guid Id, string Name);
@@ -444,4 +548,62 @@ public static class FindFirstEntityLoadItemHandler
 {
     public static EntityLoadItemCount Handle(FindFirstEntityLoadItem command, [FirstOrDefault] EntityLoadItem? item,
         EntityLoadAdminDbContext db) => new(item == null ? 0 : 1);
+}
+
+[WolverineIgnore]
+public static class RenameAllEntityLoadNotesHandler
+{
+    public static void Handle(RenameAllEntityLoadNotes command, [All] IReadOnlyList<EntityLoadNote> notes)
+    {
+        foreach (var note in notes) note.Name = "renamed";
+    }
+}
+
+[WolverineIgnore]
+public static class RenameFirstEntityLoadNoteHandler
+{
+    public static void Handle(RenameFirstEntityLoadNote command, [FirstOrDefault] EntityLoadNote? note)
+    {
+        if (note != null) note.Name = "renamed";
+    }
+}
+
+[WolverineIgnore]
+public static class RenameQueryableEntityLoadNotesHandler
+{
+    public static async Task Handle(RenameQueryableEntityLoadNotes command, [Queryable] IQueryable<EntityLoadNote> notes)
+    {
+        foreach (var note in await notes.ToListAsync()) note.Name = "renamed";
+    }
+}
+
+[WolverineIgnore]
+public static class AdminRenameAllEntityLoadItemsHandler
+{
+    [Transactional(typeof(EntityLoadAdminDbContext))]
+    public static void Handle(AdminRenameAllEntityLoadItems command, [All] IReadOnlyList<EntityLoadItem> items)
+    {
+        foreach (var item in items) item.Name = "renamed";
+    }
+}
+
+[WolverineIgnore]
+public static class RenameSpecifiedEntityLoadItemsHandler
+{
+    public static void Handle(RenameSpecifiedEntityLoadItems command,
+        [FromQuerySpecification(typeof(AllEntityLoadItemsPlan))] IReadOnlyList<EntityLoadItem> items)
+    {
+        foreach (var item in items) item.Name = "renamed";
+    }
+}
+
+[WolverineIgnore]
+public static class RenameLoadedPlanEntityLoadItemsHandler
+{
+    public static AllEntityLoadItemsPlan Load(RenameLoadedPlanEntityLoadItems command) => new();
+
+    public static void Handle(RenameLoadedPlanEntityLoadItems command, IReadOnlyList<EntityLoadItem> items)
+    {
+        foreach (var item in items) item.Name = "renamed";
+    }
 }

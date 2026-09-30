@@ -879,44 +879,81 @@ internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
         }
 
         var serviceDependencies = chain.ServiceDependencies(container, Type.EmptyTypes).ToArray();
-        if (serviceDependencies.Any(x => x.CanBeCastTo<DbContext>() || _abstractions.Contains(x))) return true;
-
-        // An [Entity] load is a DbContext dependency too, but one that ServiceDependencies() cannot see: the load
-        // frame is not a MethodCall, and EntityAttribute.Modify() only adds it at codegen, long after
-        // AutoApplyTransactions asked this question. Without this, the entity is loaded and tracked, the handler
-        // changes it, and nothing ever calls SaveChangesAsync. Same problem as Marten's GH-2941.
-        return entityLoadDbContextTypes(chain, container).Any();
+        return serviceDependencies.Any(x => x.CanBeCastTo<DbContext>() || _abstractions.Contains(x));
     }
 
     /// <summary>
-    ///     The DbContext types that the <c>[Entity]</c> and <c>[FromEfCore]</c> parameters on this chain load
-    ///     through, found by reflecting over the parameters because the load frames may not have been built yet.
+    ///     Loading through a DbContext with <c>[Entity]</c>, <c>[All]</c>, <c>[FirstOrDefault]</c>, <c>[Queryable]</c>
+    ///     or a query plan is a DbContext dependency too, exactly as taking the DbContext as a parameter would be, but
+    ///     <see cref="CanApply" /> cannot see it: the load frames are not MethodCalls, and they are only built at
+    ///     codegen, long after AutoApplyTransactions asked. Without this, the handler changes what it loaded and
+    ///     nothing ever calls SaveChangesAsync. Same problem as Marten's GH-2941.
     /// </summary>
-    private IEnumerable<Type> entityLoadDbContextTypes(IChain chain, IServiceContainer container)
+    public bool CanApplyThroughLoads(IChain chain, IServiceContainer container)
+    {
+        return chain is not SagaChain && loadedDbContextTypes(chain, container).Any();
+    }
+
+    /// <summary>
+    ///     The DbContext types this chain loads through without taking them as parameters: its <c>[Entity]</c>,
+    ///     <c>[FromEfCore]</c>, <c>[All]</c>, <c>[FirstOrDefault]</c> and <c>[Queryable]</c> parameters, and its EF Core
+    ///     query plans, whether from <c>[FromQuerySpecification]</c> or returned by a <c>Load</c>/<c>Before</c> method.
+    ///     Found by reflection, because the frames that load them may not have been built yet.
+    /// </summary>
+    private IEnumerable<Type> loadedDbContextTypes(IChain chain, IServiceContainer container)
     {
         var calls = chain.Middleware.OfType<MethodCall>().Concat(chain.HandlerCalls());
         foreach (var call in calls)
         {
             foreach (var parameter in call.Method.GetParameters())
             {
-                var att = parameter.GetCustomAttributes(true).OfType<EntityAttribute>().FirstOrDefault();
-
-                // [FromMarten] and the other explicit attributes load from their own store
-                if (att == null || (att.GetType() != typeof(EntityAttribute) && att is not FromEfCoreAttribute))
+                foreach (var attribute in parameter.GetCustomAttributes(true))
                 {
-                    continue;
+                    var dbContextType = attribute switch
+                    {
+                        FromQuerySpecificationAttribute spec => queryPlanDbContextType(spec.SpecificationType),
+
+                        // [FromMarten] and the other explicit attributes load from their own store
+                        ExplicitEntityAttribute and not FromEfCoreAttribute => null,
+
+                        IEntityLoadAttribute load => loadedDbContextType(load.DetermineLoadedEntityType(parameter), chain, container),
+                        _ => null
+                    };
+
+                    if (dbContextType != null) yield return dbContextType;
                 }
+            }
 
-                if (TryDetermineDbContextType(parameter.ParameterType, container) == null) continue;
-
-                var dbContextType = DetermineDbContextType(parameter.ParameterType, chain, container);
-
-                // A multi-tenanted DbContext can come back as its IDbContextBuilder<T> service type
-                yield return dbContextType.IsGenericType && dbContextType.GetGenericTypeDefinition() == typeof(IDbContextBuilder<>)
-                    ? dbContextType.GetGenericArguments()[0]
-                    : dbContextType;
+            // A query plan returned by a Load/Before method is fetched right after it
+            foreach (var created in call.Creates)
+            {
+                if (queryPlanDbContextType(created.VariableType) is { } dbContextType) yield return dbContextType;
             }
         }
+    }
+
+    private Type? loadedDbContextType(Type? entityType, IChain chain, IServiceContainer container)
+    {
+        if (entityType == null || TryDetermineDbContextType(entityType, container) == null) return null;
+
+        var dbContextType = DetermineDbContextType(entityType, chain, container);
+
+        // A multi-tenanted DbContext can come back as its IDbContextBuilder<T> service type
+        return dbContextType.IsGenericType && dbContextType.GetGenericTypeDefinition() == typeof(IDbContextBuilder<>)
+            ? dbContextType.GetGenericArguments()[0]
+            : dbContextType;
+    }
+
+    /// <summary>
+    ///     The DbContext an EF Core <see cref="IQueryPlan{TDbContext,TResult}" /> or
+    ///     <see cref="IBatchQueryPlan{TDbContext,TResult}" /> names, or null for any other type.
+    /// </summary>
+    private static Type? queryPlanDbContextType(Type type)
+    {
+        var plan = type.FindInterfaceThatCloses(typeof(IBatchQueryPlan<,>))
+                   ?? type.FindInterfaceThatCloses(typeof(IQueryPlan<,>));
+
+        return plan?.GetGenericArguments()[0];
     }
 
     /// <summary>
@@ -1116,7 +1153,7 @@ internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
         }
 
         var injected = injectedDbContextTypes(chain, container);
-        var loaded = entityLoadDbContextTypes(chain, container).Distinct().ToArray();
+        var loaded = loadedDbContextTypes(chain, container).Distinct().ToArray();
 
         // Explicit, no-magic disambiguation. When a chain depends on more than one DbContext-shaped
         // service, the developer designates the transactional one with either [Transactional(typeof(X))]
@@ -1129,9 +1166,9 @@ internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
             return designated;
         }
 
-        // The injected DbContexts own the transaction, exactly as before [Entity] loads were considered at all,
-        // so a handler that reads an [Entity] through one DbContext and writes through another injected one
-        // keeps working. Only a chain that injects no DbContext falls back to the one its [Entity] loads use.
+        // The injected DbContexts own the transaction, exactly as before loads were considered at all, so a
+        // handler that reads through one DbContext and writes through another injected one keeps working. Only a
+        // chain that injects no DbContext falls back to the one its loads use.
         var contextTypes = injected.Length > 0 ? injected : loaded;
 
         if (contextTypes.Length == 0)

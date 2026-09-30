@@ -125,6 +125,26 @@ public class two_provider_transaction_designation : IAsyncLifetime
         (await widgetNameAsync(host, id)).ShouldBeNull();
     }
 
+    [Fact]
+    public async Task an_entity_loaded_through_one_provider_does_not_compete_with_a_store_taken_as_a_parameter()
+    {
+        // The [Entity] Widget is loaded through EF Core, but only the Marten session is a parameter. Loading does
+        // not make EF Core a second candidate for the transaction, so Marten owns it as it would without the load.
+        using var host = await startHostAsync(typeof(ReadWidgetWriteNoteHandler));
+
+        var id = Guid.NewGuid();
+        using (var scope = host.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<WidgetDbContext>();
+            db.Widgets.Add(new Widget { Id = id, Name = "loaded" });
+            await db.SaveChangesAsync(TestContext.Current.CancellationToken);
+        }
+
+        await host.InvokeMessageAndWaitAsync(new ReadWidgetWriteNote(id));
+
+        (await noteTextAsync(host, id)).ShouldBe("read loaded");
+    }
+
     private static async Task<string?> widgetNameAsync(IHost host, Guid id)
     {
         using var scope = host.Services.CreateScope();
@@ -181,6 +201,8 @@ public record WriteToBothStoresForEfCore(Guid Id);
 
 public record WriteToBothStoresForMarten(Guid Id);
 
+public record ReadWidgetWriteNote(Guid Id);
+
 [WolverineIgnore]
 public static class AmbiguousWidgetHandler
 {
@@ -211,4 +233,11 @@ public static class MartenDesignatedWidgetHandler
         db.Widgets.Add(new Widget { Id = command.Id, Name = "ef core" });
         session.Store(new WidgetNote { Id = command.Id, Text = "marten" });
     }
+}
+
+[WolverineIgnore]
+public static class ReadWidgetWriteNoteHandler
+{
+    public static void Handle(ReadWidgetWriteNote command, [Entity] Widget widget, IDocumentSession session)
+        => session.Store(new WidgetNote { Id = command.Id, Text = $"read {widget.Name}" });
 }

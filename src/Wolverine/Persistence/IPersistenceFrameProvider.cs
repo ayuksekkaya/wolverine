@@ -25,6 +25,18 @@ public interface IPersistenceFrameProvider
     bool CanApply(IChain chain, IServiceContainer container);
 
     /// <summary>
+    ///     True when <paramref name="chain" /> reads through this provider's store only by loading —
+    ///     <c>[Entity]</c>, <c>[All]</c>, <c>[FirstOrDefault]</c>, <c>[Queryable]</c> or a query plan — rather than by
+    ///     taking the store as a parameter, which is what <see cref="CanApply" /> answers.
+    /// </summary>
+    /// <remarks>
+    ///     Only consulted when no provider can apply to the chain, so a chain that takes one store as a parameter
+    ///     and loads through another is still owned by the one it takes, exactly as before loads were considered.
+    ///     Defaults to false.
+    /// </remarks>
+    bool CanApplyThroughLoads(IChain chain, IServiceContainer container) => false;
+
+    /// <summary>
     ///     The service type that owns this chain's transaction, when that owner is itself one of the
     ///     chain's own service dependencies — EF Core's <c>DbContext</c>, chosen by
     ///     <c>DetermineDbContextType</c>. Wolverine uses this to route a handler's durable inbox row to

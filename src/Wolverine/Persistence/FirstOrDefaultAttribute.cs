@@ -42,12 +42,14 @@ namespace Wolverine.Persistence;
 /// </para>
 /// </remarks>
 [AttributeUsage(AttributeTargets.Parameter)]
-public class FirstOrDefaultAttribute : WolverineParameterAttribute
+public class FirstOrDefaultAttribute : WolverineParameterAttribute, IEntityLoadAttribute
 {
     public FirstOrDefaultAttribute()
     {
         ValueSource = ValueSource.Anything;
     }
+
+    public Type? DetermineLoadedEntityType(ParameterInfo parameter) => Nullable.GetUnderlyingType(parameter.ParameterType) ?? parameter.ParameterType;
 
     public override Variable Modify(IChain chain, ParameterInfo parameter, IServiceContainer container,
         GenerationRules rules)
