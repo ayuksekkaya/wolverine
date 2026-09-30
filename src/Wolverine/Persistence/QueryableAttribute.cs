@@ -74,6 +74,8 @@ public class QueryableAttribute : WolverineParameterAttribute
                 "registered, i.e. IntegrateWithWolverine() for Marten.");
         }
 
+        provider = provider.ForChain(chain, container);
+
         if (!provider.TryBuildQueryableFrame(elementType, container, out var frame, out var result))
         {
             throw new InvalidOperationException(

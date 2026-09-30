@@ -60,6 +60,8 @@ public class AllAttribute : WolverineParameterAttribute
                 "Marten.");
         }
 
+        provider = provider.ForChain(chain, container);
+
         if (!provider.TryBuildAllFrame(elementType, container, out var frame, out var result))
         {
             throw new InvalidOperationException(

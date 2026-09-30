@@ -65,6 +65,8 @@ public class FirstOrDefaultAttribute : WolverineParameterAttribute
                 "IntegrateWithWolverine() for Marten.");
         }
 
+        provider = provider.ForChain(chain, container);
+
         if (!provider.TryBuildFirstOrDefaultFrame(entityType, container, out var frame, out var result))
         {
             throw new InvalidOperationException(

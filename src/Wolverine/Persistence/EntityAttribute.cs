@@ -149,7 +149,7 @@ public class EntityAttribute : WolverineParameterAttribute, IDataRequirement
 
         }
 
-        provider = provider.ForChain(chain);
+        provider = provider.ForChain(chain, container);
 
         // I know it's goofy that this refers to the saga, but it should work fine here too.
         // GH-4441: the chain goes over the seam because an identity type can be a fact about the STORE. A

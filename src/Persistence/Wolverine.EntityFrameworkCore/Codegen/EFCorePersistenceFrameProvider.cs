@@ -51,24 +51,49 @@ internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
     private ImHashMap<Type, bool> _retryingExecutionStrategies = ImHashMap<Type, bool>.Empty;
 
     // Set only on the chain-bound copy that ForChain() returns
+    private IChain? _chain;
     private Type? _designatedDbContextType;
+    private Type[] _injectedDbContextTypes = [];
 
     public TransactionMiddlewareMode DefaultMode { get; set; } = TransactionMiddlewareMode.Eager;
 
     /// <summary>
-    ///     A copy of this provider that loads and writes entities through the DbContext the chain designates with
-    ///     <c>[Transactional(typeof(X))]</c> or <c>[Storage(typeof(X))]</c>, wherever X maps the entity, so they are
-    ///     tracked by the DbContext the transactional middleware saves. This provider itself when there is no
-    ///     designation.
+    ///     A copy of this provider that loads and writes the chain's entities through the DbContext the chain asks
+    ///     for, so they are tracked by the DbContext the transactional middleware saves. For each entity type, that
+    ///     is the DbContext designated with <c>[Transactional(typeof(X))]</c> or <c>[Storage(typeof(X))]</c> if it
+    ///     maps the entity, else the one injected DbContext that maps it, else the first registered DbContext that
+    ///     maps it. This provider itself when the chain neither designates nor injects a DbContext.
     /// </summary>
-    public IPersistenceFrameProvider ForChain(IChain chain)
+    public IPersistenceFrameProvider ForChain(IChain chain, IServiceContainer container)
     {
         var designated = findDesignatedDbContextType(chain);
-        if (designated == null) return this;
+        var injected = injectedDbContextTypes(chain, container);
+        if (designated == null && injected.Length == 0) return this;
 
         var bound = (EFCorePersistenceFrameProvider)MemberwiseClone();
+        bound._chain = chain;
         bound._designatedDbContextType = designated;
+        bound._injectedDbContextTypes = injected;
         return bound;
+    }
+
+    /// <summary>
+    ///     The DbContext types the chain's handlers and middleware take, directly or through a registered DbContext
+    ///     abstraction or another service's dependencies. Deliberately not the DbContexts its <c>[Entity]</c>
+    ///     parameters load through.
+    /// </summary>
+    private Type[] injectedDbContextTypes(IChain chain, IServiceContainer container)
+    {
+        var dependencies = chain.ServiceDependencies(container, Type.EmptyTypes).ToArray();
+
+        var contextTypes = dependencies.Where(x => x.CanBeCastTo<DbContext>()).ToArray();
+        var abstractionTypes = dependencies.Where(x => _abstractions.Contains(x)).ToArray();
+
+        return contextTypes
+            .Concat(abstractionTypes.Select(x => _abstractions.TryFind(x, out var concrete) ? concrete : null))
+            .OfType<Type>() // Removes nullability
+            .Distinct()
+            .ToArray();
     }
 
     public void RegisterAbstraction(Type abstractionType, Type dbContextType)
@@ -992,6 +1017,19 @@ internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
             return _designatedDbContextType;
         }
 
+        var injected = _injectedDbContextTypes.Where(x => dbContextMaps(x, entityType, container)).ToArray();
+        if (injected.Length == 1)
+        {
+            return injected[0];
+        }
+
+        if (injected.Length > 1)
+        {
+            throw new InvalidOperationException(
+                $"Cannot determine the {nameof(DbContext)} type for {entityType.FullNameInCode()} on {_chain!.Description}, it is mapped by more than one injected {nameof(DbContext)}: {injected.Select(x => x.Name).Join(", ")}. " +
+                $"Designate the one to use with [Transactional(typeof(YourDbContext))] or [Storage(typeof(YourDbContext))] on the handler.");
+        }
+
         var contextType = TryDetermineDbContextType(entityType, container);
         if (contextType == null)
         {
@@ -1003,12 +1041,12 @@ internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
     }
 
     /// <summary>
-    ///     The DbContext an entity on <paramref name="chain" /> is loaded and written through. The chain's
-    ///     designated DbContext wins when it maps the entity; otherwise the first registered DbContext that maps it.
+    ///     The DbContext an entity on <paramref name="chain" /> is loaded and written through. See
+    ///     <see cref="ForChain" /> for the order of precedence.
     /// </summary>
     internal Type DetermineDbContextType(Type entityType, IChain chain, IServiceContainer container)
     {
-        return ((EFCorePersistenceFrameProvider)ForChain(chain)).DetermineDbContextType(entityType, container);
+        return ((EFCorePersistenceFrameProvider)ForChain(chain, container)).DetermineDbContextType(entityType, container);
     }
 
     /// <summary>
@@ -1077,33 +1115,24 @@ internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
             return DetermineDbContextType(saga.SagaType, container);
         }
 
-        IEnumerable<Type> FindDbContextTypes()
-        {
-            var dependencies = chain.ServiceDependencies(container, Type.EmptyTypes);
-
-            var contextTypes = dependencies.Where(x => x.CanBeCastTo<DbContext>()).ToArray();
-            var abstractionTypes = dependencies.Where(x => _abstractions.Contains(x)).ToArray();
-
-            return contextTypes
-                .Concat(abstractionTypes.Select(x => _abstractions.TryFind(x, out var concrete) ? concrete : null))
-                .Concat(entityLoadDbContextTypes(chain, container))
-                .OfType<Type>() // Removes nullability
-                .Distinct()
-                .ToArray();
-        }
-
-        var contextTypes = FindDbContextTypes().ToArray();
+        var injected = injectedDbContextTypes(chain, container);
+        var loaded = entityLoadDbContextTypes(chain, container).Distinct().ToArray();
 
         // Explicit, no-magic disambiguation. When a chain depends on more than one DbContext-shaped
         // service, the developer designates the transactional one with either [Transactional(typeof(X))]
         // (carried as a chain tag) or [Storage(typeof(X))] (carried as chain.AncillaryStoreType). X may
         // be a concrete DbContext or a registered DbContext abstraction. A designation that names a type
         // the chain does not actually depend on fails loudly rather than silently picking a default.
-        var designated = resolveDesignatedDbContext(chain, contextTypes);
+        var designated = resolveDesignatedDbContext(chain, injected.Union(loaded).ToArray());
         if (designated != null)
         {
             return designated;
         }
+
+        // The injected DbContexts own the transaction, exactly as before [Entity] loads were considered at all,
+        // so a handler that reads an [Entity] through one DbContext and writes through another injected one
+        // keeps working. Only a chain that injects no DbContext falls back to the one its [Entity] loads use.
+        var contextTypes = injected.Length > 0 ? injected : loaded;
 
         if (contextTypes.Length == 0)
         {
