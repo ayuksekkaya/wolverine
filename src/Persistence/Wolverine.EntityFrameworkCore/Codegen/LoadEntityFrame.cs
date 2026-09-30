@@ -8,12 +8,12 @@ namespace Wolverine.EntityFrameworkCore.Codegen;
 
 internal class LoadEntityFrame : AsyncFrame
 {
-    private readonly Type _dbContextType;
+    private readonly DbContextChoice _dbContextType;
     private readonly Variable _sagaId;
     private Variable? _cancellation;
     private Variable? _context;
 
-    public LoadEntityFrame(Type dbContextType, Type sagaType, Variable sagaId)
+    public LoadEntityFrame(DbContextChoice dbContextType, Type sagaType, Variable sagaId)
     {
         _dbContextType = dbContextType;
         _sagaId = sagaId;
@@ -25,7 +25,7 @@ internal class LoadEntityFrame : AsyncFrame
 
     public override IEnumerable<Variable> FindVariables(IMethodVariables chain)
     {
-        _context = chain.FindVariable(_dbContextType);
+        _context = chain.FindVariable(_dbContextType.Resolve());
         yield return _context;
 
         _cancellation = chain.FindVariable(typeof(CancellationToken));

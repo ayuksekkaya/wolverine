@@ -36,6 +36,21 @@ public static class GenerationRulesExtensions
     private static readonly IPersistenceFrameProvider _nullo = new InMemoryPersistenceFrameProvider();
 
     /// <summary>
+    ///     The providers that can own <paramref name="chain" />'s transaction: those whose store it takes as a
+    ///     parameter, or, only when there are none, those it loads through.
+    /// </summary>
+    internal static IPersistenceFrameProvider[] TransactionCandidates(this IEnumerable<IPersistenceFrameProvider> providers,
+        IChain chain, IServiceContainer container)
+    {
+        var all = providers.ToArray();
+        var candidates = all.Where(x => x.CanApply(chain, container)).ToArray();
+
+        return candidates.Length > 0
+            ? candidates
+            : all.Where(x => x.CanApplyThroughLoadsOrWrites(chain, container)).ToArray();
+    }
+
+    /// <summary>
     ///     The currently known strategy for code generating transaction middleware
     /// </summary>
     public static void AddPersistenceStrategy<T>(this GenerationRules rules) where T : IPersistenceFrameProvider, new()
@@ -176,7 +191,7 @@ public static class GenerationRulesExtensions
     internal static IPersistenceFrameProvider SelectTransactionOwner(this GenerationRules rules, IChain chain,
         IServiceContainer container)
     {
-        var potentials = rules.OrderedPersistenceProviders().Where(x => x.CanApply(chain, container)).ToArray();
+        var potentials = rules.OrderedPersistenceProviders().TransactionCandidates(chain, container);
 
         if (potentials.Length > 1 && chain is not SagaChain)
         {
@@ -194,7 +209,7 @@ public static class GenerationRulesExtensions
     {
         if (rules.Properties.TryGetValue(PersistenceKey, out var raw) && raw is List<IPersistenceFrameProvider>)
         {
-            return rules.OrderedPersistenceProviders().FirstOrDefault(x => x.CanApply(chain, container)) ?? _nullo;
+            return rules.OrderedPersistenceProviders().TransactionCandidates(chain, container).FirstOrDefault() ?? _nullo;
         }
 
         return _nullo;

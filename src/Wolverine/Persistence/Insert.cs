@@ -21,6 +21,7 @@ public record Insert<T>(T Entity) : ISideEffectAware, IStorageAction<T>
     {
         if (rules.TryFindPersistenceFrameProvider(container, typeof(T), out var provider))
         {
+            provider = provider.ForChain(chain, container);
             provider.ApplyTransactionSupport(chain, container, typeof(T));
             var value = new EntityVariable(variable);
 

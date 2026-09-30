@@ -426,6 +426,10 @@ public partial class HandlerGraph : ICodeFileCollectionWithServices, IWithFailur
 
         foreach (var policy in handlerPolicies(options)) policy.Apply(allChains, Rules, container);
 
+        // Every policy has had its say, so the persistence providers can settle which store each chain loads,
+        // writes and commits through -- before the runtime routes durable inboxes by it
+        foreach (var chain in allChains) chain.FinalizePersistence(Rules, container);
+
         Container = container;
 
         // 6.0 forwarder registration: drain the explicit

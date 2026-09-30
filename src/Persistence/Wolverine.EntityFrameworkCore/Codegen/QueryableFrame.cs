@@ -13,13 +13,13 @@ namespace Wolverine.EntityFrameworkCore.Codegen;
 /// </summary>
 internal class QueryableFrame : SyncFrame
 {
-    private readonly Type _dbContextType;
+    private readonly DbContextChoice _dbContextType;
     private readonly Type _elementType;
     private Variable? _context;
 
     [UnconditionalSuppressMessage("AOT", "IL3050",
         Justification = "MakeGenericType closes IReadOnlyList<>/IQueryable<> over the element type at CODEGEN time only. AOT consumers run pre-generated code in TypeLoadMode.Static, so this never fires in a published app. See the AOT guide.")]
-    public QueryableFrame(Type dbContextType, Type elementType)
+    public QueryableFrame(DbContextChoice dbContextType, Type elementType)
     {
         _dbContextType = dbContextType;
         _elementType = elementType;
@@ -40,7 +40,7 @@ internal class QueryableFrame : SyncFrame
 
     public override IEnumerable<Variable> FindVariables(IMethodVariables chain)
     {
-        _context = chain.FindVariable(_dbContextType);
+        _context = chain.FindVariable(_dbContextType.Resolve());
         yield return _context;
     }
 }

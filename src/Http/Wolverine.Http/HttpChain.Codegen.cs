@@ -118,6 +118,9 @@ public partial class HttpChain
 
     internal IEnumerable<Frame> DetermineFrames(GenerationRules rules)
     {
+        // Normally done at the end of endpoint discovery, but not for a chain that never went through it
+        this.FinalizePersistence(rules, _parent.Container);
+
         // Add frames for any writers
         if (ResourceType != typeof(void))
         {

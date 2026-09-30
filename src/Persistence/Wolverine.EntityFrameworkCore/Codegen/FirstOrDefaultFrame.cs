@@ -17,12 +17,12 @@ namespace Wolverine.EntityFrameworkCore.Codegen;
 /// </remarks>
 internal class FirstOrDefaultFrame : AsyncFrame
 {
-    private readonly Type _dbContextType;
+    private readonly DbContextChoice _dbContextType;
     private readonly Type _entityType;
     private Variable? _context;
     private Variable? _cancellation;
 
-    public FirstOrDefaultFrame(Type dbContextType, Type entityType)
+    public FirstOrDefaultFrame(DbContextChoice dbContextType, Type entityType)
     {
         _dbContextType = dbContextType;
         _entityType = entityType;
@@ -42,7 +42,7 @@ internal class FirstOrDefaultFrame : AsyncFrame
 
     public override IEnumerable<Variable> FindVariables(IMethodVariables chain)
     {
-        _context = chain.FindVariable(_dbContextType);
+        _context = chain.FindVariable(_dbContextType.Resolve());
         yield return _context;
 
         _cancellation = chain.FindVariable(typeof(CancellationToken));

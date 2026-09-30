@@ -18,14 +18,14 @@ namespace Wolverine.EntityFrameworkCore.Codegen;
 /// </remarks>
 internal class AllFrame : AsyncFrame
 {
-    private readonly Type _dbContextType;
+    private readonly DbContextChoice _dbContextType;
     private readonly Type _entityType;
     private Variable? _context;
     private Variable? _cancellation;
 
     [UnconditionalSuppressMessage("AOT", "IL3050",
         Justification = "MakeGenericType closes IReadOnlyList<>/IQueryable<> over the element type at CODEGEN time only. AOT consumers run pre-generated code in TypeLoadMode.Static, so this never fires in a published app. See the AOT guide.")]
-    public AllFrame(Type dbContextType, Type entityType)
+    public AllFrame(DbContextChoice dbContextType, Type entityType)
     {
         _dbContextType = dbContextType;
         _entityType = entityType;
@@ -44,7 +44,7 @@ internal class AllFrame : AsyncFrame
 
     public override IEnumerable<Variable> FindVariables(IMethodVariables chain)
     {
-        _context = chain.FindVariable(_dbContextType);
+        _context = chain.FindVariable(_dbContextType.Resolve());
         yield return _context;
 
         _cancellation = chain.FindVariable(typeof(CancellationToken));

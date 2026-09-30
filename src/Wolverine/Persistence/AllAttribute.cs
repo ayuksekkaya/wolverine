@@ -39,11 +39,26 @@ namespace Wolverine.Persistence;
 /// </para>
 /// </remarks>
 [AttributeUsage(AttributeTargets.Parameter)]
-public class AllAttribute : WolverineParameterAttribute
+public class AllAttribute : WolverineParameterAttribute, IEntityLoadAttribute
 {
     public AllAttribute()
     {
         ValueSource = ValueSource.Anything;
+    }
+
+    public Type? DetermineLoadedEntityType(ParameterInfo parameter) => tryDetermineElementType(parameter);
+
+    private static Type? tryDetermineElementType(ParameterInfo parameter)
+    {
+        try
+        {
+            return DetermineElementType(parameter);
+        }
+        catch (InvalidOperationException)
+        {
+            // Modify() reports the unsupported parameter shape at codegen
+            return null;
+        }
     }
 
     public override Variable Modify(IChain chain, ParameterInfo parameter, IServiceContainer container,
@@ -59,6 +74,8 @@ public class AllAttribute : WolverineParameterAttribute
                 "persistence integration for this type has been registered, i.e. IntegrateWithWolverine() for " +
                 "Marten.");
         }
+
+        provider = provider.ForChain(chain, container);
 
         if (!provider.TryBuildAllFrame(elementType, container, out var frame, out var result))
         {

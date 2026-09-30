@@ -36,26 +36,30 @@ internal class LoadEntityWithQueryOptionsFrame : AsyncFrame
     // generated method is full of user-named locals.
     private const string LambdaParameter = "__entity";
 
-    private readonly Type _dbContextType;
+    private readonly DbContextChoice _dbContextType;
     private readonly Type _entityType;
     private readonly Variable _id;
-    private readonly string _keyPropertyName;
-    private readonly Type _keyType;
+    private string _keyPropertyName = null!;
+    private Type _keyType = null!;
     private readonly string[] _includes;
     private readonly bool _asNoTracking;
     private Variable? _context;
     private Variable? _cancellation;
 
-    public LoadEntityWithQueryOptionsFrame(Type dbContextType, Type entityType, Variable id, string keyPropertyName,
-        Type keyType, string[] includes, bool asNoTracking)
+    /// <param name="primaryKeyFor">
+    ///     The entity's single-valued primary key in the chosen DbContext's model. Also where that model is checked
+    ///     against the includes and no-tracking request, so it throws if any of it cannot be honored.
+    /// </param>
+    public LoadEntityWithQueryOptionsFrame(DbContextChoice dbContextType, Type entityType, Variable id,
+        string[] includes, bool asNoTracking, Func<Type, (string Name, Type Type)> primaryKeyFor)
     {
         _dbContextType = dbContextType;
         _entityType = entityType;
         _id = id;
-        _keyPropertyName = keyPropertyName;
-        _keyType = keyType;
         _includes = includes;
         _asNoTracking = asNoTracking;
+
+        dbContextType.WhenChosen(type => (_keyPropertyName, _keyType) = primaryKeyFor(type));
 
         Entity = new Variable(entityType, this);
     }
@@ -64,7 +68,7 @@ internal class LoadEntityWithQueryOptionsFrame : AsyncFrame
 
     public override IEnumerable<Variable> FindVariables(IMethodVariables chain)
     {
-        _context = chain.FindVariable(_dbContextType);
+        _context = chain.FindVariable(_dbContextType.Resolve());
         yield return _context;
 
         _cancellation = chain.FindVariable(typeof(CancellationToken));

@@ -24,7 +24,7 @@ internal class AutoApplyTransactions : IChainPolicy
             }
             
             chain.ApplyImpliedMiddlewareFromHandlers(rules);
-            var potentials = providers.Where(x => x.CanApply(chain, container)).ToArray();
+            var potentials = providers.TransactionCandidates(chain, container);
             if (potentials.Length == 1)
             {
                 potentials.Single().ApplyTransactionSupport(chain, container);

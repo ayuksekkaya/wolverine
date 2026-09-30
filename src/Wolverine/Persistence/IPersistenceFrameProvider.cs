@@ -25,6 +25,18 @@ public interface IPersistenceFrameProvider
     bool CanApply(IChain chain, IServiceContainer container);
 
     /// <summary>
+    ///     True when <paramref name="chain" /> uses this provider's store without taking it as a parameter, which is
+    ///     what <see cref="CanApply" /> answers: by loading through it — <c>[Entity]</c>, <c>[All]</c>,
+    ///     <c>[FirstOrDefault]</c>, <c>[Queryable]</c> or a query plan — or by returning storage actions for it.
+    /// </summary>
+    /// <remarks>
+    ///     Only consulted when no provider can apply to the chain, so a chain that takes one store as a parameter
+    ///     and loads through another is still owned by the one it takes, exactly as before loads were considered.
+    ///     Defaults to false.
+    /// </remarks>
+    bool CanApplyThroughLoadsOrWrites(IChain chain, IServiceContainer container) => false;
+
+    /// <summary>
     ///     The service type that owns this chain's transaction, when that owner is itself one of the
     ///     chain's own service dependencies — EF Core's <c>DbContext</c>, chosen by
     ///     <c>DetermineDbContextType</c>. Wolverine uses this to route a handler's durable inbox row to
@@ -94,6 +106,34 @@ public interface IPersistenceFrameProvider
     /// </remarks>
     Type DetermineSagaIdType(Type sagaType, IChain chain, IServiceContainer container)
         => DetermineSagaIdType(sagaType, container);
+
+    /// <summary>
+    ///     The provider to build <paramref name="chain" />'s entity load and storage action frames with.
+    /// </summary>
+    /// <remarks>
+    ///     A provider that can hold one entity type in more than one store — EF Core, when two DbContexts map
+    ///     the same entity — returns a view of itself bound to the chain, so that every load and write it builds
+    ///     goes through the store the chain's persistence plan picks (see <see cref="FinalizePersistence" />)
+    ///     rather than a default one the transactional middleware never saves. Defaults to this provider,
+    ///     unchanged.
+    /// </remarks>
+    IPersistenceFrameProvider ForChain(IChain chain, IServiceContainer container) => this;
+
+    /// <summary>
+    ///     Called once for every chain, after its configuration is complete — every policy has run and every
+    ///     middleware it will get from them has been added — and before Wolverine routes durable inboxes or
+    ///     generates code for it. A provider that has to choose between stores resolves the chain's choices here,
+    ///     once, so that its loads, writes, transaction and inbox routing all agree. Defaults to doing nothing.
+    /// </summary>
+    /// <remarks>
+    ///     A chain's parameters and some of its transactional middleware are built before this point (an HTTP
+    ///     endpoint's <c>[Entity]</c> parameters while the endpoint is constructed, <c>AutoApplyTransactions()</c>
+    ///     while policies run), so a provider that defers those choices to here has to leave room for them in
+    ///     the frames it builds. See <see cref="ChainPersistenceExtensions.IsPersistenceFinalized" />.
+    /// </remarks>
+    void FinalizePersistence(IChain chain, IServiceContainer container)
+    {
+    }
 
     Frame DetermineLoadFrame(IServiceContainer container, Type sagaType, Variable sagaId);
     Frame DetermineInsertFrame(Variable saga, IServiceContainer container);

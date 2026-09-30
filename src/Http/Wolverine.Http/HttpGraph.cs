@@ -245,6 +245,11 @@ public partial class HttpGraph : EndpointDataSource, ICodeFileCollectionWithServ
 
         foreach (var policy in wolverineHttpOptions.Policies) policy.Apply(_chains, Rules, Container);
 
+        // Every policy and middleware has been applied, so the persistence providers can settle which store each
+        // endpoint loads, writes and commits through. Its [Entity] parameters were built while it was constructed,
+        // long before now, which is why they leave that choice to this point.
+        foreach (var chain in _chains) chain.FinalizePersistence(Rules, Container);
+
         // GH-4156. BEFORE BuildEndpoint, deliberately. In TypeLoadMode.Static BuildEndpoint already forces
         // the handler build for every chain -- regardless of RouteWarmup -- so a missing pre-built type does
         // already fail the mapping rather than the first request. What it fails with is the problem: JasperFx

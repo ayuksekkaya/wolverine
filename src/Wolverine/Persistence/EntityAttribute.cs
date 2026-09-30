@@ -89,7 +89,7 @@ public class LoadEntityFrameBlock : Frame
 /// Apply this on a message handler method, an HTTP endpoint method, or any "before" middleware method parameter
 /// to direct Wolverine to use a known persistence strategy to resolve the entity from the request or message
 /// </summary>
-public class EntityAttribute : WolverineParameterAttribute, IDataRequirement
+public class EntityAttribute : WolverineParameterAttribute, IDataRequirement, IEntityLoadAttribute
 {
     private OnMissing? _onMissing;
     private bool? _maybeSoftDeleted;
@@ -134,6 +134,8 @@ public class EntityAttribute : WolverineParameterAttribute, IDataRequirement
         set => _maybeSoftDeleted = value;
     }
 
+    public Type? DetermineLoadedEntityType(ParameterInfo parameter) => parameter.ParameterType;
+
     public override Variable Modify(IChain chain, ParameterInfo parameter, IServiceContainer container,
         GenerationRules rules)
     {
@@ -148,6 +150,8 @@ public class EntityAttribute : WolverineParameterAttribute, IDataRequirement
                                                 parameter.ParameterType.FullNameInCode());
 
         }
+
+        provider = provider.ForChain(chain, container);
 
         // I know it's goofy that this refers to the saga, but it should work fine here too.
         // GH-4441: the chain goes over the seam because an identity type can be a fact about the STORE. A

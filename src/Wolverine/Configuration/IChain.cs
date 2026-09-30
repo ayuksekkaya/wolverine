@@ -279,6 +279,20 @@ public interface IChain
     IEnumerable<Type> ServiceDependencies(IServiceContainer container, IReadOnlyList<Type> stopAtTypes);
 
     /// <summary>
+    ///     The method calls this chain will make once its configuration is complete: its middleware and handler
+    ///     calls, plus the Before/Load/Validate methods of its handler types that
+    ///     <see cref="ApplyImpliedMiddlewareFromHandlers" /> has not added to <see cref="Middleware" /> yet. A
+    ///     message handler only gets those once <c>[Transactional]</c>, <c>AutoApplyTransactions()</c> or code
+    ///     generation asks for them, which is later than anything planning the chain's persistence can wait for.
+    /// </summary>
+    IEnumerable<MethodCall> PlannedMethodCalls();
+
+    /// <summary>
+    ///     <see cref="ServiceDependencies" /> of <see cref="PlannedMethodCalls" />, walked the same way
+    /// </summary>
+    IEnumerable<Type> PlannedServiceDependencies(IServiceContainer container, IReadOnlyList<Type> stopAtTypes);
+
+    /// <summary>
     ///     Does this chain have the designated attribute type anywhere in
     ///     its handlers?
     /// </summary>

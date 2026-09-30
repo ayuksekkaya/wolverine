@@ -764,6 +764,9 @@ public class HandlerChain : Chain<HandlerChain, ModifyHandlerChainAttribute>, IW
 
     protected void applyCustomizations(GenerationRules rules, IServiceContainer container)
     {
+        // Normally done at the end of HandlerGraph.Compile(), but not for a chain that never went through it
+        this.FinalizePersistence(rules, container);
+
         if (!_hasConfiguredFrames)
         {
             _hasConfiguredFrames = true;

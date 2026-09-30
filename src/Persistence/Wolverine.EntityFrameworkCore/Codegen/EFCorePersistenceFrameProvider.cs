@@ -13,6 +13,7 @@ using Microsoft.Extensions.Logging;
 using Wolverine.Attributes;
 using Wolverine.Configuration;
 using Wolverine.EntityFrameworkCore.Internals;
+using Wolverine.Middleware;
 using Wolverine.Persistence;
 using Wolverine.Persistence.Durability;
 using Wolverine.Persistence.Sagas;
@@ -42,10 +43,11 @@ namespace Wolverine.EntityFrameworkCore.Codegen;
     Justification = "EFCore codegen frame provider — MakeGenericMethod over EfCoreStorageActionApplier's helpers, closed at codegen time over entity / DbContext types mapped in a registered DbContext. See AOT guide.")]
 [UnconditionalSuppressMessage("AOT", "IL3050",
     Justification = "EFCore codegen frame provider — closed generics over runtime DbContext / entity types at codegen time. See AOT guide.")]
-internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
+internal partial class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
 {
     public const string UsingEfCoreTransaction = "uses_efcore_transaction";
     public const string TransactionModeKey = "TransactionMiddlewareMode";
+    private const string PendingTransactionKey = "efcore_pending_transaction";
     private ImHashMap<Type, Type?> _dbContextTypes = ImHashMap<Type, Type?>.Empty;
     private ImHashMap<Type, Type> _abstractions = ImHashMap<Type, Type>.Empty;
     private ImHashMap<Type, bool> _retryingExecutionStrategies = ImHashMap<Type, bool>.Empty;
@@ -116,26 +118,14 @@ internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
 
     public Type DetermineSagaIdType(Type sagaType, IServiceContainer container)
     {
-        var dbContextType = DetermineDbContextType(sagaType, container);
-        using var nested = container.Services.CreateScope();
-        var context = (DbContext)nested.ServiceProvider.GetRequiredService(dbContextType);
-        var config = context.Model.FindEntityType(sagaType);
-        if (config == null)
-        {
-            throw new InvalidOperationException(
-                $"Could not find entity configuration for {sagaType.FullNameInCode()} in DbContext {context}");
-        }
-
-        return config.FindPrimaryKey()?.GetKeyType() ??
-               throw new InvalidOperationException(
-                   $"No known primary key for {sagaType.FullNameInCode()} in DbContext {context}");
+        return primaryKeyType(DetermineDbContextType(sagaType, container), sagaType, container);
     }
 
     public bool TryBuildAllFrame(Type entityType, IServiceContainer container,
         [NotNullWhen(true)] out Frame? frame,
         [NotNullWhen(true)] out Variable? result)
     {
-        var all = new AllFrame(DetermineDbContextType(entityType, container), entityType);
+        var all = new AllFrame(choiceFor(entityType, container), entityType);
         frame = all;
         result = all.Result;
         return true;
@@ -145,8 +135,7 @@ internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
         [NotNullWhen(true)] out Frame? frame,
         [NotNullWhen(true)] out Variable? result)
     {
-        var dbContextType = DetermineDbContextType(entityType, container);
-        var first = new FirstOrDefaultFrame(dbContextType, entityType);
+        var first = new FirstOrDefaultFrame(choiceFor(entityType, container), entityType);
         frame = first;
         result = first.Result;
         return true;
@@ -156,7 +145,7 @@ internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
         [NotNullWhen(true)] out Frame? frame,
         [NotNullWhen(true)] out Variable? result)
     {
-        var queryable = new QueryableFrame(DetermineDbContextType(elementType, container), elementType);
+        var queryable = new QueryableFrame(choiceFor(elementType, container), elementType);
         frame = queryable;
         result = queryable.Result;
         return true;
@@ -164,16 +153,15 @@ internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
 
     public Frame DetermineLoadFrame(IServiceContainer container, Type sagaType, Variable sagaId)
     {
-        var dbContextType = DetermineDbContextType(sagaType, container);
-        return new LoadEntityFrame(dbContextType, sagaType, sagaId);
+        return new LoadEntityFrame(choiceFor(sagaType, container), sagaType, sagaId);
     }
 
     /// <summary>
     ///     The <c>[FromEfCore]</c> load frame for a parameter that asked for <c>AsNoTracking</c> or eager
-    ///     <c>Include</c> paths. Validates every request against the EF Core model at CODEGEN time and throws if
-    ///     any of it cannot be honored, because the alternative — quietly emitting the plain
-    ///     <c>FindAsync</c> load and dropping the request — produces a handler that looks correct, compiles, runs,
-    ///     and hands back an entity with unpopulated navigations.
+    ///     <c>Include</c> paths. Validates every request against the EF Core model of the DbContext it loads through,
+    ///     at codegen or when the chain is finalized, and throws if any of it cannot be honored, because the
+    ///     alternative — quietly emitting the plain <c>FindAsync</c> load and dropping the request — produces a
+    ///     handler that looks correct, compiles, runs, and hands back an entity with unpopulated navigations.
     /// </summary>
     /// <param name="usage">
     ///     How to name the offending declaration in an exception, supplied by the attribute because only it knows
@@ -182,8 +170,13 @@ internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
     internal Frame DetermineLoadFrameWithQueryOptions(IServiceContainer container, Type entityType, Variable id,
         string[] includes, bool asNoTracking, string usage)
     {
-        var dbContextType = DetermineDbContextType(entityType, container);
+        return new LoadEntityWithQueryOptionsFrame(choiceFor(entityType, container), entityType, id, includes,
+            asNoTracking, dbContextType => queryablePrimaryKey(container, dbContextType, entityType, includes, usage));
+    }
 
+    private static (string Name, Type Type) queryablePrimaryKey(IServiceContainer container, Type dbContextType,
+        Type entityType, string[] includes, string usage)
+    {
         using var nested = container.Services.CreateScope();
         var context = resolveDbContext(nested, dbContextType);
 
@@ -216,8 +209,7 @@ internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
         }
 
         var keyProperty = key.Properties[0];
-        return new LoadEntityWithQueryOptionsFrame(dbContextType, entityType, id, keyProperty.Name,
-            keyProperty.ClrType, includes, asNoTracking);
+        return (keyProperty.Name, keyProperty.ClrType);
     }
 
     private static DbContext resolveDbContext(IServiceScope scope, Type dbContextType)
@@ -267,8 +259,7 @@ internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
 
     public Frame DetermineInsertFrame(Variable saga, IServiceContainer container)
     {
-        var dbContextType = DetermineDbContextType(saga.VariableType, container);
-        return new DbContextOperationFrame(dbContextType, saga, nameof(DbContext.Add));
+        return new DbContextOperationFrame(choiceFor(saga.VariableType, container), saga, nameof(DbContext.Add));
     }
 
     public Frame CommitUnitOfWorkFrame(Variable saga, IServiceContainer container)
@@ -313,7 +304,7 @@ internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
     /// </remarks>
     public Frame DetermineStorageUpdateFrame(Variable entity, IServiceContainer container)
     {
-        return applierCall(nameof(EfCoreStorageActionApplier.UpdateAsync), entity, container);
+        return applierCall(nameof(EfCoreStorageActionApplier.UpdateAsync), entity.VariableType, entity, container);
     }
 
     /// <summary>
@@ -322,23 +313,26 @@ internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
     ///     <c>IStorageAction&lt;T&gt;</c> return type run literally the same code. GH-4613 was the two
     ///     paths quietly disagreeing.
     /// </summary>
-    private MethodCall applierCall(string methodName, Variable entity, IServiceContainer container)
+    private Frame applierCall(string methodName, Type entityType, Variable argument, IServiceContainer container)
     {
-        var dbContextType = DetermineDbContextType(entity.VariableType, container);
+        MethodCall build(Type dbContextType)
+        {
+            var method = typeof(EfCoreStorageActionApplier).GetMethod(methodName)!
+                .MakeGenericMethod(entityType, dbContextType);
 
-        var method = typeof(EfCoreStorageActionApplier).GetMethod(methodName)!
-            .MakeGenericMethod(entity.VariableType, dbContextType);
+            var call = new MethodCall(typeof(EfCoreStorageActionApplier), method);
+            call.Arguments[1] = argument;
 
-        var call = new MethodCall(typeof(EfCoreStorageActionApplier), method);
-        call.Arguments[1] = entity;
+            return call;
+        }
 
-        return call;
+        var dbContext = choiceFor(entityType, container);
+        return dbContext.IsChosen ? build(dbContext.Resolve()) : new DeferredApplierCall(dbContext, build);
     }
 
     public Frame DetermineDeleteFrame(Variable sagaId, Variable saga, IServiceContainer container)
     {
-        var dbContextType = DetermineDbContextType(saga.VariableType, container);
-        return new DbContextOperationFrame(dbContextType, saga, nameof(DbContext.Remove));
+        return new DbContextOperationFrame(choiceFor(saga.VariableType, container), saga, nameof(DbContext.Remove));
     }
 
     public Frame DetermineDeleteFrame(Variable variable, IServiceContainer container)
@@ -348,15 +342,7 @@ internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
 
     public Frame DetermineStorageActionFrame(Type entityType, Variable action, IServiceContainer container)
     {
-        var dbContextType = DetermineDbContextType(entityType, container);
-        
-        var method = typeof(EfCoreStorageActionApplier).GetMethod("ApplyAction")!
-            .MakeGenericMethod(entityType, dbContextType);
-
-        var call = new MethodCall(typeof(EfCoreStorageActionApplier), method);
-        call.Arguments[1] = action;
-
-        return call;
+        return applierCall(nameof(EfCoreStorageActionApplier.ApplyAction), entityType, action, container);
     }
 
     /// <summary>
@@ -374,15 +360,7 @@ internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
             return false;
         }
 
-        var dbContextType = DetermineDbContextType(entityType, container);
-
-        var method = typeof(EfCoreStorageActionApplier).GetMethod(nameof(EfCoreStorageActionApplier.ApplyActionsAsync))!
-            .MakeGenericMethod(entityType, dbContextType);
-
-        var call = new MethodCall(typeof(EfCoreStorageActionApplier), method);
-        call.Arguments[1] = unitOfWork;
-
-        frame = call;
+        frame = applierCall(nameof(EfCoreStorageActionApplier.ApplyActionsAsync), entityType, unitOfWork, container);
         return true;
     }
 
@@ -394,23 +372,151 @@ internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
     /// </summary>
     public Frame DetermineStoreFrame(Variable saga, IServiceContainer container)
     {
-        return applierCall(nameof(EfCoreStorageActionApplier.StoreAsync), saga, container);
+        return applierCall(nameof(EfCoreStorageActionApplier.StoreAsync), saga.VariableType, saga, container);
     }
 
     public void ApplyTransactionSupport(IChain chain, IServiceContainer container)
     {
+        requestTransaction(chain, container, forStorageAction: false);
+    }
+
+    /// <summary>
+    ///     Apply the transactional middleware for the chain's transaction owner, now if the chain is finalized, or else
+    ///     once it is. Until then, the owner is not known: AutoApplyTransactions() and returned storage actions ask for
+    ///     the transaction while policies run, and an HTTP endpoint's [Transactional] while it is constructed, before
+    ///     later policies and middleware have been applied. Placeholders hold the transaction's places in the chain,
+    ///     so that it ends up exactly where it would have gone had it been applied then -- ahead of anything later
+    ///     policies insert at the front, like HTTP tenant detection, which has to run before a tenanted DbContext is
+    ///     built.
+    /// </summary>
+    private void requestTransaction(IChain chain, IServiceContainer container, bool forStorageAction)
+    {
         if (chain.Tags.ContainsKey(UsingEfCoreTransaction)) return;
         chain.Tags.Add(UsingEfCoreTransaction, true);
 
-        var dbContextType = DetermineDbContextType(chain, container);
+        if (chain.IsPersistenceFinalized())
+        {
+            applyTransaction(chain, container, PlanFor(chain, container), forStorageAction, null);
+            return;
+        }
 
+        var pending = new PendingTransaction(forStorageAction);
+        chain.Middleware.Insert(0, pending.Middleware);
+        chain.Postprocessors.Add(pending.Postprocessor);
+        chain.Tags[PendingTransactionKey] = pending;
+    }
+
+    private void applyPendingTransaction(IChain chain, IServiceContainer container, EfCorePersistencePlan plan)
+    {
+        if (!chain.Tags.TryGetValue(PendingTransactionKey, out var raw) || raw is not PendingTransaction pending) return;
+
+        chain.Tags.Remove(PendingTransactionKey);
+        applyTransaction(chain, container, plan, pending.ForStorageAction, pending);
+    }
+
+    private void applyTransaction(IChain chain, IServiceContainer container, EfCorePersistencePlan plan,
+        bool forStorageAction, PendingTransaction? pending)
+    {
+        var dbContextType = plan.RequireTransactionOwner();
+
+        foreach (var entityType in writtenEntityTypes(chain))
+        {
+            assertWriteIsSaved(chain, container, plan, entityType, dbContextType);
+        }
+
+        var front = new List<Frame>();
+        var post = new List<Frame>();
+        buildTransaction(chain, container, dbContextType, forStorageAction, front, post);
+
+        if (pending == null)
+        {
+            chain.Middleware.InsertRange(0, front);
+            chain.Postprocessors.AddRange(post);
+        }
+        else
+        {
+            replace(chain.Middleware, pending.Middleware, front, atEnd: false);
+            replace(chain.Postprocessors, pending.Postprocessor, post, atEnd: true);
+        }
+    }
+
+    private static void replace(List<Frame> frames, Frame placeholder, List<Frame> replacements, bool atEnd)
+    {
+        var index = frames.IndexOf(placeholder);
+        if (index >= 0)
+        {
+            frames.RemoveAt(index);
+            frames.InsertRange(index, replacements);
+        }
+        else if (atEnd)
+        {
+            frames.AddRange(replacements);
+        }
+        else
+        {
+            frames.InsertRange(0, replacements);
+        }
+    }
+
+    /// <summary>
+    ///     A storage action is applied to the DbContext chosen for its entity type, so that DbContext has to be the one
+    ///     the transactional middleware saves, or the write is silently dropped
+    /// </summary>
+    private void assertWriteIsSaved(IChain chain, IServiceContainer container, EfCorePersistencePlan plan,
+        Type entityType, Type owner)
+    {
+        var dbType = normalize(DbContextFor(plan, chain, entityType, container));
+        if (dbType == owner) return;
+
+        if (plan.Designated == owner)
+        {
+            throw new InvalidOperationException(
+                $"{chain.Description} designates {owner.FullNameInCode()} as its transactional {nameof(DbContext)}, but returns a storage action for {entityType.FullNameInCode()}, which {owner.NameInCode()} does not map. " +
+                $"The storage action would be applied to {dbType.FullNameInCode()}, which the transactional middleware does not save. Map {entityType.NameInCode()} in {owner.NameInCode()}, or designate {dbType.NameInCode()} instead.");
+        }
+
+        throw new InvalidOperationException(
+            $"{chain.Description} commits through {owner.FullNameInCode()}, but returns a storage action for {entityType.FullNameInCode()}, which would be applied to {dbType.FullNameInCode()}, which the transactional middleware does not save. " +
+            $"Designate the {nameof(DbContext)} that owns the transaction with [Transactional(typeof(YourDbContext))] or [Storage(typeof(YourDbContext))] on the handler.");
+    }
+
+    private sealed class PendingTransaction(bool forStorageAction)
+    {
+        public bool ForStorageAction { get; } = forStorageAction;
+        public Frame Middleware { get; } = new TransactionPlaceholder();
+        public Frame Postprocessor { get; } = new TransactionPlaceholder();
+    }
+
+    private sealed class TransactionPlaceholder : SyncFrame
+    {
+        public override void GenerateCode(GeneratedMethod method, ISourceWriter writer)
+        {
+            throw new InvalidOperationException(
+                "The EF Core transactional middleware was never finalized for this chain. This is a Wolverine bug.");
+        }
+    }
+
+    /// <summary>
+    ///     Builds the transactional middleware for <paramref name="dbContextType" />, the chain's transaction owner:
+    ///     <paramref name="front" /> goes at the front of the chain's middleware in order, <paramref name="post" /> at
+    ///     the end of its postprocessors.
+    /// </summary>
+    /// <param name="forStorageAction">
+    ///     Whether a returned storage action asked for the transaction, rather than <c>AutoApplyTransactions()</c>,
+    ///     <c>[Transactional]</c> or a saga. See the GH-3353 branch below.
+    /// </param>
+    [UnconditionalSuppressMessage("Trimming", "IL2070",
+        Justification = "DbContext.SaveChangesAsync lookup on a statically-rooted DbContext type. See AOT guide.")]
+    private void buildTransaction(IChain chain, IServiceContainer container, Type dbContextType,
+        bool forStorageAction, List<Frame> front, List<Frame> post)
+    {
         var mode = ResolveEffectiveMode(chain);
 
         var runtime = container.Services.GetRequiredService<IWolverineRuntime>();
         if (runtime.Stores.HasAncillaryStoreFor(dbContextType))
         {
             var frame = typeof(ApplyAncillaryStoreFrame<>).CloseAndBuildAs<Frame>(dbContextType);
-            chain.Middleware.Insert(0, frame);
+            front.Insert(0, frame);
         }
 
         var enrolledInTransaction = false;
@@ -425,13 +531,13 @@ internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
             {
                 var createContext = typeof(CreateTenantedDbContext<>).CloseAndBuildAs<Frame>(dbContextType);
 
-                chain.Middleware.Insert(0, createContext);
-                chain.Middleware.Insert(0, new StartDatabaseTransactionForDbContext(dbContextType, chain.Idempotency));
+                front.Insert(0, createContext);
+                front.Insert(0, new StartDatabaseTransactionForDbContext(dbContextType, chain.Idempotency));
                 multiTenantTransaction = true;
             }
             else
             {
-                chain.Middleware.Insert(0, new EnrollDbContextInTransaction(dbContextType, chain.Idempotency));
+                front.Insert(0, new EnrollDbContextInTransaction(dbContextType, chain.Idempotency));
                 enrolledInTransaction = true;
             }
         }
@@ -449,13 +555,20 @@ internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
             // This also closes the second half of GH-4611 for free: BuildAndEnrollAsync enlists the
             // MessageContext in the outbox, which is exactly what the GH-3291 branch below does for a
             // non-tenanted DbContext, and why that branch's old !isMultiTenanted guard is gone.
-            chain.Middleware.Insert(0, typeof(CreateTenantedDbContext<>).CloseAndBuildAs<Frame>(dbContextType));
+            front.Insert(0, typeof(CreateTenantedDbContext<>).CloseAndBuildAs<Frame>(dbContextType));
             tenantedLightweight = true;
         }
         else if (isHttpChain(chain)
-                 && chain.ShouldFlushOutgoingMessages()
+                 && (forStorageAction || chain.ShouldFlushOutgoingMessages())
                  && hasDatabaseBackedMessagePersistence(container))
         {
+            // GH-3353: a storage action does NOT gate on ShouldFlushOutgoingMessages()/RequiresOutbox(). It is
+            // applied from SideEffectPolicy, which the WolverineOptions constructor registers ahead of
+            // OutgoingMessagesPolicy, and HttpChain.RequiresOutbox() only reflects an injected
+            // IMessageBus/MessageContext - an endpoint that cascades purely through its return tuple (the very
+            // shape that returns a storage action instead of injecting the DbContext) can never satisfy it.
+            // Enlisting when the endpoint turns out not to cascade anything is a no-op flush at commit time.
+            //
             // GH-3291: A Wolverine.Http endpoint has no incoming envelope, so - unlike a message handler,
             // whose MessageContext is enlisted by MessageContext.ReadEnvelope at runtime - its
             // MessageContext.Transaction stays null in Lightweight mode. Cascaded messages would then be
@@ -473,7 +586,7 @@ internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
             // cascades were dispatched pre-commit all the same. Enlisting an endpoint that turns out not
             // to cascade anything is a no-op flush at commit time, so over-enlisting is safe; the
             // message-database guard above keeps persistence-less applications on send-now.
-            chain.Middleware.Insert(0, new EnlistDbContextInOutbox(dbContextType));
+            front.Insert(0, new EnlistDbContextInOutbox(dbContextType));
             enrolledInTransaction = true;
         }
         else if (!isHttpChain(chain) && chain.RequiresOutbox() && hasDatabaseBackedMessagePersistence(container))
@@ -497,15 +610,11 @@ internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
             // CommitEfCoreEnvelopeTransaction would drag EfCoreEnvelopeTransaction.CommitAsync's inbox
             // bookkeeping onto a path that has no transaction for it to run in. A message handler's inbox
             // row is the pipeline's business; all this path owes the outbox is the scrape and a save.
-            chain.Middleware.Insert(0, new EnlistDbContextInOutbox(dbContextType, chain.Idempotency));
+            front.Insert(0, new EnlistDbContextInOutbox(dbContextType, chain.Idempotency));
             lightweightEnlisted = true;
         }
 
-        var abstractionType = chain.ServiceDependencies(container, Type.EmptyTypes).FirstOrDefault(x => _abstractions.Contains(x));
-        if (abstractionType != null)
-        {
-            chain.Middleware.Insert(0, new CastDbContextFrame(abstractionType, dbContextType));
-        }
+        insertAbstractionCast(chain, container, dbContextType, front);
 
         var saveChangesAsync =
             dbContextType.GetMethod(nameof(DbContext.SaveChangesAsync), [typeof(CancellationToken)]);
@@ -515,10 +624,26 @@ internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
             CommentText = "Added by EF Core Transaction Middleware"
         };
 
-        chain.Postprocessors.Add(call);
+        post.Add(call);
 
-        applyEagerCommitOrLightweightFlush(chain, mode, enrolledInTransaction, multiTenantTransaction, dbContextType,
-            tenantedLightweight, lightweightEnlisted);
+        applyEagerCommitOrLightweightFlush(chain, post, mode, enrolledInTransaction, multiTenantTransaction,
+            dbContextType, tenantedLightweight, lightweightEnlisted);
+    }
+
+    /// <summary>
+    ///     Let a DbContext abstraction the chain takes stand in for the DbContext that owns the transaction. Only an
+    ///     abstraction registered for that DbContext can: the chain may also take the abstraction of another one,
+    ///     which the generated cast would reject on every message.
+    /// </summary>
+    private void insertAbstractionCast(IChain chain, IServiceContainer container, Type dbContextType, List<Frame> front)
+    {
+        var abstractionType = chain.PlannedServiceDependencies(container, Type.EmptyTypes)
+            .FirstOrDefault(x => _abstractions.TryFind(x, out var concrete) && concrete == dbContextType);
+
+        if (abstractionType != null)
+        {
+            front.Insert(0, new CastDbContextFrame(abstractionType, dbContextType));
+        }
     }
 
     // Eager mode wraps the rest of the chain in a transaction middleware's try/catch. The commit +
@@ -542,17 +667,17 @@ internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
     //    postprocessor is the only flush trigger and must stay.
     //
     // Exactly one of these runs, and at most one of them flushes.
-    private static void applyEagerCommitOrLightweightFlush(IChain chain, TransactionMiddlewareMode mode,
+    private static void applyEagerCommitOrLightweightFlush(IChain chain, List<Frame> post, TransactionMiddlewareMode mode,
         bool enrolledInTransaction, bool multiTenantTransaction, Type dbContextType,
         bool tenantedLightweight, bool lightweightEnlisted)
     {
         if (enrolledInTransaction)
         {
-            chain.Postprocessors.Add(new CommitEfCoreEnvelopeTransaction());
+            post.Add(new CommitEfCoreEnvelopeTransaction());
         }
         else if (multiTenantTransaction)
         {
-            chain.Postprocessors.Add(new CommitTenantedDbContextTransaction(dbContextType));
+            post.Add(new CommitTenantedDbContextTransaction(dbContextType));
         }
         else if (tenantedLightweight)
         {
@@ -564,7 +689,7 @@ internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
             //
             // GH-4630: a message handler's pipeline does its own flush, so that chain gets the scrape
             // and the save without one. Neither shape ran the domain event scrapers before.
-            chain.Postprocessors.Add(chain.ShouldFlushOutgoingMessages()
+            post.Add(chain.ShouldFlushOutgoingMessages()
                 ? new FlushTenantedDbContextOutbox(dbContextType)
                 : new ScrapeDomainEventsAndSaveChanges(dbContextType, false));
         }
@@ -573,13 +698,13 @@ internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
             // GH-4630. No flush here: Executor/TracingExecutor call FlushOutgoingMessagesAsync() once
             // the handler returns, and adding a second trigger would either double-send or trip the
             // MultiFlushMode.OnlyOnce warning.
-            chain.Postprocessors.Add(new ScrapeDomainEventsAndSaveChanges(dbContextType, false));
+            post.Add(new ScrapeDomainEventsAndSaveChanges(dbContextType, false));
         }
         else if (mode != TransactionMiddlewareMode.Eager
                  && chain.RequiresOutbox() && chain.ShouldFlushOutgoingMessages())
         {
 #pragma warning disable CS4014
-            chain.Postprocessors.Add(new FlushOutgoingMessages());
+            post.Add(new FlushOutgoingMessages());
 #pragma warning restore CS4014
         }
     }
@@ -734,131 +859,22 @@ internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
         // silently skipped). Fall through and apply EF Core's transaction support in that case.
         if (chain is SagaChain saga && TryDetermineDbContextType(saga.SagaType, container) != null) return;
 
-        if (chain.Tags.ContainsKey(UsingEfCoreTransaction)) return;
-        chain.Tags.Add(UsingEfCoreTransaction, true);
+        recordWrittenEntityType(chain, entityType);
 
-        var dbType = DetermineDbContextType(entityType, container);
-
-        var mode = ResolveEffectiveMode(chain);
-
-        var enrolledInTransaction = false;
-        var multiTenantTransaction = false;
-        var tenantedLightweight = false;
-        var lightweightEnlisted = false;
-        if (mode == TransactionMiddlewareMode.Eager)
+        // On an HTTP chain [Transactional] has usually applied the transaction already. The storage action still has
+        // to be written through the DbContext it saves.
+        if (chain.Tags.ContainsKey(UsingEfCoreTransaction))
         {
-            assertNoRetryingExecutionStrategy(chain, container, dbType);
-
-            if (isMultiTenanted(container, dbType))
+            if (!chain.Tags.ContainsKey(PendingTransactionKey) && chain.IsPersistenceFinalized())
             {
-                var createContext = typeof(CreateTenantedDbContext<>).CloseAndBuildAs<Frame>(dbType);
-                chain.Middleware.Insert(0, createContext);
-                chain.Middleware.Insert(0, new StartDatabaseTransactionForDbContext(dbType, chain.Idempotency));
-                multiTenantTransaction = true;
+                var plan = PlanFor(chain, container);
+                assertWriteIsSaved(chain, container, plan, entityType, plan.RequireTransactionOwner());
             }
-            else
-            {
-                chain.Middleware.Insert(0, new EnrollDbContextInTransaction(dbType, chain.Idempotency));
-                enrolledInTransaction = true;
-            }
-        }
-        else if (isMultiTenanted(container, dbType))
-        {
-            // GH-4611, the storage-action counterpart of the branch in the no-entity overload above. See
-            // there for why Lightweight mode has to build the DbContext through the tenant builder too.
-            chain.Middleware.Insert(0, typeof(CreateTenantedDbContext<>).CloseAndBuildAs<Frame>(dbType));
-            tenantedLightweight = true;
-        }
-        else if (isHttpChain(chain) && hasDatabaseBackedMessagePersistence(container))
-        {
-            // GH-3353, the storage-action counterpart to the GH-3291 branch in the no-entity overload
-            // above: a Wolverine.Http endpoint has no incoming envelope, so its MessageContext.Transaction
-            // stays null in Lightweight mode and cascaded messages are dispatched by the send-now branch
-            // of MessageBus.PersistOrSendAsync BEFORE the SaveChangesAsync postprocessor commits.
-            //
-            // Unlike that branch, do NOT gate on chain.RequiresOutbox(). This overload runs from
-            // SideEffectPolicy, which the WolverineOptions constructor registers ahead of
-            // OutgoingMessagesPolicy, and HttpChain.RequiresOutbox() only reflects an injected
-            // IMessageBus/MessageContext - an endpoint that cascades purely through its return tuple
-            // (the very shape that returns a storage action instead of injecting the DbContext) can
-            // never satisfy it here. Enlisting when the endpoint turns out not to cascade anything is a
-            // no-op flush at commit time.
-            chain.Middleware.Insert(0, new EnlistDbContextInOutbox(dbType));
-            enrolledInTransaction = true;
-        }
-        else if (!isHttpChain(chain) && chain.RequiresOutbox() && hasDatabaseBackedMessagePersistence(container))
-        {
-            // GH-4630, the storage-action counterpart of the message-handler branch in the no-entity
-            // overload above. See there for why a Lightweight message handler's cascades need the
-            // DbContext enlisted even though its MessageContext already buffers them.
-            chain.Middleware.Insert(0, new EnlistDbContextInOutbox(dbType, chain.Idempotency));
-            lightweightEnlisted = true;
+
+            return;
         }
 
-        var abstractionType = chain.ServiceDependencies(container, Type.EmptyTypes).FirstOrDefault(x => _abstractions.Contains(x));
-        if (abstractionType != null)
-        {
-            chain.Middleware.Insert(0, new CastDbContextFrame(abstractionType, dbType));
-        }
-
-        var saveChangesAsync =
-            dbType.GetMethod(nameof(DbContext.SaveChangesAsync), [typeof(CancellationToken)]);
-
-        var call = new MethodCall(dbType, saveChangesAsync!)
-        {
-            CommentText = "Added by EF Core Transaction Middleware"
-        };
-
-        chain.Postprocessors.Add(call);
-
-        // See applyEagerCommitOrLightweightFlush + the no-entity overload above (GH-2917).
-        applyEagerCommitOrLightweightFlush(chain, mode, enrolledInTransaction, multiTenantTransaction, dbType,
-            tenantedLightweight, lightweightEnlisted);
-    }
-
-    public bool CanApply(IChain chain, IServiceContainer container)
-    {
-        if (chain is SagaChain saga)
-        {
-            var sagaType = saga.SagaType;
-            return TryDetermineDbContextType(sagaType, container) != null;
-        }
-
-        var serviceDependencies = chain.ServiceDependencies(container, Type.EmptyTypes).ToArray();
-        return serviceDependencies.Any(x => x.CanBeCastTo<DbContext>() || _abstractions.Contains(x));
-    }
-
-    /// <summary>
-    /// GH-4631. EF Core is designated by a <c>DbContext</c> type or a registered DbContext abstraction —
-    /// the same two spellings <see cref="DetermineDbContextType(IChain,IServiceContainer)" /> already
-    /// resolves when a chain depends on more than one DbContext.
-    /// </summary>
-    public bool OwnsStorageType(Type storageType, IServiceContainer container)
-    {
-        return storageType.CanBeCastTo<DbContext>() || _abstractions.Contains(storageType);
-    }
-
-    /// <summary>
-    /// EF Core is the one provider whose transaction owner is a plain service dependency, so it is the one
-    /// provider that can tell Wolverine which enrolled store a handler's durable inbox row belongs in
-    /// (GH-3870). Deliberately the same <see cref="DetermineDbContextType(IChain,IServiceContainer)" /> the
-    /// transactional middleware uses, so the inbox row and the SaveChanges land in the same database.
-    /// </summary>
-    public Type? TryDetermineTransactionOwnerType(IChain chain, IServiceContainer container)
-    {
-        if (!CanApply(chain, container)) return null;
-
-        try
-        {
-            return DetermineDbContextType(chain, container);
-        }
-        catch (Exception)
-        {
-            // Ambiguous or unresolvable - DetermineDbContextType throws a chain-specific message that
-            // codegen surfaces to the developer. This runs at startup while building the inbox routing
-            // map, where the safe answer is "no ancillary store", exactly as before GH-3870.
-            return null;
-        }
+        requestTransaction(chain, container, forStorageAction: true);
     }
 
     internal Type? TryDetermineDbContextType(Type entityType, IServiceContainer container)
@@ -919,151 +935,6 @@ internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
         return null;
     }
     
-    internal Type DetermineDbContextType(Type entityType, IServiceContainer container)
-    {
-        var contextType = TryDetermineDbContextType(entityType, container);
-        if (contextType == null)
-        {
-            throw new ArgumentOutOfRangeException("Unable to determine a DbContext type that persists " +
-                                                  entityType.FullNameInCode());
-        }
-
-        return contextType;
-    }
-
-    public Type DetermineDbContextType(IChain chain, IServiceContainer container)
-    {
-        if (chain is SagaChain saga)
-        {
-            return DetermineDbContextType(saga.SagaType, container);
-        }
-
-        IEnumerable<Type> FindDbContextTypes()
-        {
-            var dependencies = chain.ServiceDependencies(container, Type.EmptyTypes);
-
-            var contextTypes = dependencies.Where(x => x.CanBeCastTo<DbContext>()).ToArray();
-            var abstractionTypes = dependencies.Where(x => _abstractions.Contains(x)).ToArray();
-
-            return contextTypes
-                .Concat(abstractionTypes.Select(x => _abstractions.TryFind(x, out var concrete) ? concrete : null))
-                .OfType<Type>() // Removes nullability
-                .Distinct()
-                .ToArray();
-        }
-
-        var contextTypes = FindDbContextTypes().ToArray();
-
-        // Explicit, no-magic disambiguation. When a chain depends on more than one DbContext-shaped
-        // service, the developer designates the transactional one with either [Transactional(typeof(X))]
-        // (carried as a chain tag) or [Storage(typeof(X))] (carried as chain.AncillaryStoreType). X may
-        // be a concrete DbContext or a registered DbContext abstraction. A designation that names a type
-        // the chain does not actually depend on fails loudly rather than silently picking a default.
-        var designated = resolveDesignatedDbContext(chain, contextTypes);
-        if (designated != null)
-        {
-            return designated;
-        }
-
-        if (contextTypes.Length == 0)
-        {
-            var sagaType = chain.HandlerCalls().SelectMany(x => x.Creates)
-                .Where(x => x.VariableType.CanBeCastTo<Saga>())
-                .Select(x => x.VariableType)
-                .FirstOrDefault();
-
-            if (sagaType != null)
-            {
-                return DetermineDbContextType(sagaType, container);
-            }
-
-            throw new InvalidOperationException(
-                $"Cannot determine the {nameof(DbContext)} type for {chain.Description}");
-        }
-
-        if (contextTypes.Length > 1)
-        {
-            throw new InvalidOperationException(
-                $"Cannot determine the {nameof(DbContext)} type for {chain.Description}, multiple {nameof(DbContext)} types detected: {contextTypes.Select(x => x.Name).Join(", ")}. " +
-                $"Wolverine will not guess which one owns the transaction. Either remove the automatic transactional middleware from this handler (e.g. with [NonTransactional] or by not calling AutoApplyTransactions), " +
-                $"or explicitly designate the transactional {nameof(DbContext)} with [Transactional(typeof(YourDbContext))] or [Storage(typeof(YourDbContext))] on the handler.");
-        }
-
-        return contextTypes.Single();
-    }
-
-    /// <summary>
-    /// Resolve an explicit transactional-DbContext designation for this chain, or null when there is
-    /// none. Two equivalent, EF-Core-agnostic markers are honored:
-    /// <list type="bullet">
-    /// <item><c>[Transactional(typeof(X))]</c> — carried as the <see cref="TransactionalAttribute.TransactionalDbContextTypeKey"/> chain tag.</item>
-    /// <item><c>[Storage(typeof(X))]</c> — carried as <see cref="IChain.AncillaryStoreType"/>.</item>
-    /// </list>
-    /// X may be a concrete DbContext or a registered DbContext abstraction. A designation that names a
-    /// type the chain does not depend on throws; a <see cref="IChain.AncillaryStoreType"/> that names a
-    /// non-DbContext ancillary store (a genuine Marten/Polecat secondary store) is ignored here.
-    /// </summary>
-    private Type? resolveDesignatedDbContext(IChain chain, Type[] contextTypes)
-    {
-        if (chain.Tags.TryGetValue(TransactionalAttribute.TransactionalDbContextTypeKey, out var tagged)
-            && tagged is Type taggedType)
-        {
-            return validateDesignation(taggedType, chain, contextTypes, "[Transactional]");
-        }
-
-        // [Storage(typeof(X))] designation. We read the attribute directly off the handler rather than
-        // relying on chain.AncillaryStoreType, because DetermineDbContextType runs from
-        // AutoApplyTransactions before the StorageAttribute's eager policy / Modify has populated
-        // AncillaryStoreType. Only honored when X resolves to one of this chain's DbContext candidates;
-        // a [Storage] that names a genuine Marten/Polecat ancillary store on some other chain is ignored
-        // here and left to that integration.
-        var storageType = findStorageAttributeType(chain) ?? chain.AncillaryStoreType;
-        if (storageType != null)
-        {
-            var resolved = _abstractions.TryFind(storageType, out var concrete) ? concrete : storageType;
-
-            // If it names a DbContext-shaped type (or registered abstraction) but isn't actually a
-            // dependency, fail loudly the same way the [Transactional] tag does — a typo shouldn't
-            // silently fall through to the ambiguity error.
-            if (resolved.CanBeCastTo<DbContext>() || _abstractions.Contains(storageType))
-            {
-                return validateDesignation(storageType, chain, contextTypes, "[Storage]");
-            }
-        }
-
-        return null;
-    }
-
-    private static Type? findStorageAttributeType(IChain chain)
-    {
-        foreach (var call in chain.HandlerCalls())
-        {
-            var att = call.Method.GetCustomAttribute<StorageAttribute>(inherit: true)
-                      ?? call.HandlerType.GetCustomAttribute<StorageAttribute>(inherit: true);
-
-            if (att != null)
-            {
-                return att.StoreType;
-            }
-        }
-
-        return null;
-    }
-
-    private Type validateDesignation(Type designated, IChain chain, Type[] contextTypes, string source)
-    {
-        var resolved = _abstractions.TryFind(designated, out var concrete) ? concrete : designated;
-
-        if (!contextTypes.Contains(resolved))
-        {
-            throw new InvalidOperationException(
-                $"The {source} DbContextType {designated.FullNameInCode()} on {chain.Description} is not one of this chain's dependencies (directly or via a registered DbContext abstraction). " +
-                $"Detected {nameof(DbContext)} types: {(contextTypes.Length == 0 ? "none" : contextTypes.Select(x => x.Name).Join(", "))}");
-        }
-
-        return resolved;
-    }
-
     public class CastDbContextFrame : SyncFrame
     {
         private readonly Type _abstractionType;

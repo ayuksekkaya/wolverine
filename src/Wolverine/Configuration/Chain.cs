@@ -138,7 +138,35 @@ public abstract class Chain<TChain, TModifyAttribute> : IChain
     /// <returns></returns>
     public IEnumerable<Type> ServiceDependencies(IServiceContainer container, IReadOnlyList<Type> stopAtTypes)
     {
-        return serviceDependencies(container, stopAtTypes).Concat(_dependencies).Distinct();
+        var calls = Middleware.OfType<MethodCall>().Concat(HandlerCalls());
+        return serviceDependencies(calls, container, stopAtTypes).Concat(_dependencies).Distinct();
+    }
+
+    [UnconditionalSuppressMessage("Trimming", "IL2075",
+        Justification = "Handler-type method walks for [Wolverine*] attributes, exactly as ApplyImpliedMiddlewareFromHandlers does; handler types statically rooted via HandlerDiscovery. See AOT guide.")]
+    public IEnumerable<MethodCall> PlannedMethodCalls()
+    {
+        var calls = Middleware.OfType<MethodCall>().Concat(HandlerCalls()).ToList();
+        if (_appliedImpliedMiddleware) return calls;
+
+        var added = calls.Select(x => x.Method).ToHashSet();
+        foreach (var handlerType in HandlerCalls().Select(x => x.HandlerType).Distinct())
+        {
+            var befores = MiddlewarePolicy.FilterMethods<WolverineBeforeAttribute>(this, handlerType.GetMethods(),
+                MiddlewarePolicy.BeforeMethodNames);
+
+            foreach (var before in befores.Where(added.Add))
+            {
+                calls.Add(new MethodCall(handlerType, before));
+            }
+        }
+
+        return calls;
+    }
+
+    public IEnumerable<Type> PlannedServiceDependencies(IServiceContainer container, IReadOnlyList<Type> stopAtTypes)
+    {
+        return serviceDependencies(PlannedMethodCalls(), container, stopAtTypes).Concat(_dependencies).Distinct();
     }
 
     public abstract bool HasAttribute<T>() where T : Attribute;
@@ -330,10 +358,9 @@ public abstract class Chain<TChain, TModifyAttribute> : IChain
         return true;
     }
 
-    private IEnumerable<Type> serviceDependencies(IServiceContainer container, IReadOnlyList<Type> stopAtTypes)
+    private IEnumerable<Type> serviceDependencies(IEnumerable<MethodCall> calls, IServiceContainer container,
+        IReadOnlyList<Type> stopAtTypes)
     {
-        var calls = Middleware.OfType<MethodCall>().Concat(HandlerCalls());
-
         foreach (var call in calls)
         {
             yield return call.HandlerType;

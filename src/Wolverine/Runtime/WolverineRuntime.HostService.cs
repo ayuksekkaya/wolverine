@@ -844,13 +844,19 @@ public partial class WolverineRuntime
     {
         if (markerTypes.Length == 0) return null;
 
-        // Cheap pre-filter: no marker anywhere in the dependency graph means there is nothing to infer,
-        // and the provider (which may build DbContexts to answer) never has to be consulted.
-        var dependencies = chain.ServiceDependencies(_container, Type.EmptyTypes).ToArray();
-        if (!markerTypes.Any(dependencies.Contains)) return null;
-
         try
         {
+            // Cheap pre-filter: no marker anywhere in the dependency graph means there is nothing to infer,
+            // and the provider never has to be consulted. Unless the chain loads through or writes to a store
+            // without taking it as a dependency, e.g. with an EF Core [Entity] or a returned Storage.Insert(),
+            // which get that store's transactional middleware all the same.
+            var dependencies = chain.PlannedServiceDependencies(_container, Type.EmptyTypes).ToArray();
+            if (!markerTypes.Any(dependencies.Contains)
+                && !Options.CodeGeneration.PersistenceProviders().Any(x => x.CanApplyThroughLoadsOrWrites(chain, _container)))
+            {
+                return null;
+            }
+
             var owner = Options.CodeGeneration.GetPersistenceProviders(chain, _container)
                 .TryDetermineTransactionOwnerType(chain, _container);
 
