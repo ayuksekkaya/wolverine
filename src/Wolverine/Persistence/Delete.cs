@@ -21,6 +21,7 @@ public record Delete<T>(T Entity) : ISideEffectAware, IStorageAction<T>
     {
         if (rules.TryFindPersistenceFrameProvider(container, typeof(T), out var provider))
         {
+            provider = provider.ForChain(chain);
             provider.ApplyTransactionSupport(chain, container, typeof(T));
             var value = new EntityVariable(variable);
             return provider.DetermineDeleteFrame(value, container).WrapIfNotNull(variable);

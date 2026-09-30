@@ -22,6 +22,7 @@ public interface IStorageAction<T> : ISideEffectAware
     {
         if (rules.TryFindPersistenceFrameProvider(container, typeof(T), out var provider))
         {
+            provider = provider.ForChain(chain);
             provider.ApplyTransactionSupport(chain, container, typeof(T));
 
             // GH-4613: DetermineStorageActionFrame wants the ACTION -- it becomes the
@@ -98,6 +99,7 @@ public class UnitOfWork<T> : List<IStorageAction<T>>, ISideEffectAware
     {
         if (rules.TryFindPersistenceFrameProvider(container, typeof(T), out var provider))
         {
+            provider = provider.ForChain(chain);
             provider.ApplyTransactionSupport(chain, container, typeof(T));
 
             // GH-4629: let a provider apply the whole unit of work at once when it can beat the

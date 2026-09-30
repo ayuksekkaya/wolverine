@@ -50,7 +50,26 @@ internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
     private ImHashMap<Type, Type> _abstractions = ImHashMap<Type, Type>.Empty;
     private ImHashMap<Type, bool> _retryingExecutionStrategies = ImHashMap<Type, bool>.Empty;
 
+    // Set only on the chain-bound copy that ForChain() returns
+    private Type? _designatedDbContextType;
+
     public TransactionMiddlewareMode DefaultMode { get; set; } = TransactionMiddlewareMode.Eager;
+
+    /// <summary>
+    ///     A copy of this provider that loads and writes entities through the DbContext the chain designates with
+    ///     <c>[Transactional(typeof(X))]</c> or <c>[Storage(typeof(X))]</c>, wherever X maps the entity, so they are
+    ///     tracked by the DbContext the transactional middleware saves. This provider itself when there is no
+    ///     designation.
+    /// </summary>
+    public IPersistenceFrameProvider ForChain(IChain chain)
+    {
+        var designated = findDesignatedDbContextType(chain);
+        if (designated == null) return this;
+
+        var bound = (EFCorePersistenceFrameProvider)MemberwiseClone();
+        bound._designatedDbContextType = designated;
+        return bound;
+    }
 
     public void RegisterAbstraction(Type abstractionType, Type dbContextType)
     {
@@ -734,10 +753,20 @@ internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
         // silently skipped). Fall through and apply EF Core's transaction support in that case.
         if (chain is SagaChain saga && TryDetermineDbContextType(saga.SagaType, container) != null) return;
 
+        // Checked before the idempotency guard below, because on an HTTP chain [Transactional] has usually
+        // applied transaction support already, and the storage action would still be written through a
+        // DbContext that nothing saves
+        var dbType = DetermineDbContextType(entityType, chain, container);
+        var designated = findDesignatedDbContextType(chain);
+        if (designated != null && designated != dbType)
+        {
+            throw new InvalidOperationException(
+                $"{chain.Description} designates {designated.FullNameInCode()} as its transactional {nameof(DbContext)}, but returns a storage action for {entityType.FullNameInCode()}, which {designated.NameInCode()} does not map. " +
+                $"The storage action would be applied to {dbType.FullNameInCode()}, which the transactional middleware does not save. Map {entityType.NameInCode()} in {designated.NameInCode()}, or designate {dbType.NameInCode()} instead.");
+        }
+
         if (chain.Tags.ContainsKey(UsingEfCoreTransaction)) return;
         chain.Tags.Add(UsingEfCoreTransaction, true);
-
-        var dbType = DetermineDbContextType(entityType, container);
 
         var mode = ResolveEffectiveMode(chain);
 
@@ -825,7 +854,44 @@ internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
         }
 
         var serviceDependencies = chain.ServiceDependencies(container, Type.EmptyTypes).ToArray();
-        return serviceDependencies.Any(x => x.CanBeCastTo<DbContext>() || _abstractions.Contains(x));
+        if (serviceDependencies.Any(x => x.CanBeCastTo<DbContext>() || _abstractions.Contains(x))) return true;
+
+        // An [Entity] load is a DbContext dependency too, but one that ServiceDependencies() cannot see: the load
+        // frame is not a MethodCall, and EntityAttribute.Modify() only adds it at codegen, long after
+        // AutoApplyTransactions asked this question. Without this, the entity is loaded and tracked, the handler
+        // changes it, and nothing ever calls SaveChangesAsync. Same problem as Marten's GH-2941.
+        return entityLoadDbContextTypes(chain, container).Any();
+    }
+
+    /// <summary>
+    ///     The DbContext types that the <c>[Entity]</c> and <c>[FromEfCore]</c> parameters on this chain load
+    ///     through, found by reflecting over the parameters because the load frames may not have been built yet.
+    /// </summary>
+    private IEnumerable<Type> entityLoadDbContextTypes(IChain chain, IServiceContainer container)
+    {
+        var calls = chain.Middleware.OfType<MethodCall>().Concat(chain.HandlerCalls());
+        foreach (var call in calls)
+        {
+            foreach (var parameter in call.Method.GetParameters())
+            {
+                var att = parameter.GetCustomAttributes(true).OfType<EntityAttribute>().FirstOrDefault();
+
+                // [FromMarten] and the other explicit attributes load from their own store
+                if (att == null || (att.GetType() != typeof(EntityAttribute) && att is not FromEfCoreAttribute))
+                {
+                    continue;
+                }
+
+                if (TryDetermineDbContextType(parameter.ParameterType, container) == null) continue;
+
+                var dbContextType = DetermineDbContextType(parameter.ParameterType, chain, container);
+
+                // A multi-tenanted DbContext can come back as its IDbContextBuilder<T> service type
+                yield return dbContextType.IsGenericType && dbContextType.GetGenericTypeDefinition() == typeof(IDbContextBuilder<>)
+                    ? dbContextType.GetGenericArguments()[0]
+                    : dbContextType;
+            }
+        }
     }
 
     /// <summary>
@@ -921,6 +987,11 @@ internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
     
     internal Type DetermineDbContextType(Type entityType, IServiceContainer container)
     {
+        if (_designatedDbContextType != null && dbContextMaps(_designatedDbContextType, entityType, container))
+        {
+            return _designatedDbContextType;
+        }
+
         var contextType = TryDetermineDbContextType(entityType, container);
         if (contextType == null)
         {
@@ -929,6 +1000,74 @@ internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
         }
 
         return contextType;
+    }
+
+    /// <summary>
+    ///     The DbContext an entity on <paramref name="chain" /> is loaded and written through. The chain's
+    ///     designated DbContext wins when it maps the entity; otherwise the first registered DbContext that maps it.
+    /// </summary>
+    internal Type DetermineDbContextType(Type entityType, IChain chain, IServiceContainer container)
+    {
+        return ((EFCorePersistenceFrameProvider)ForChain(chain)).DetermineDbContextType(entityType, container);
+    }
+
+    /// <summary>
+    ///     The concrete DbContext type the chain designates, or null. Reads the attributes off the handler rather
+    ///     than relying on the chain tag or AncillaryStoreType alone, because on a handler chain the parameter
+    ///     attributes (and so the [Entity] load) are applied BEFORE the chain attributes.
+    /// </summary>
+    private Type? findDesignatedDbContextType(IChain chain)
+    {
+        var designated = chain.Tags.TryGetValue(TransactionalAttribute.TransactionalDbContextTypeKey, out var tagged)
+            ? tagged as Type
+            : null;
+
+        designated ??= findTransactionalAttributeType(chain) ?? findStorageAttributeType(chain) ?? chain.AncillaryStoreType;
+        if (designated == null) return null;
+
+        var resolved = _abstractions.TryFind(designated, out var concrete) ? concrete : designated;
+        return resolved.CanBeCastTo<DbContext>() ? resolved : null;
+    }
+
+    private static Type? findTransactionalAttributeType(IChain chain)
+    {
+        foreach (var call in chain.HandlerCalls())
+        {
+            var att = call.Method.GetCustomAttribute<TransactionalAttribute>(inherit: true)
+                      ?? call.HandlerType.GetCustomAttribute<TransactionalAttribute>(inherit: true);
+
+            if (att?.DbContextType != null)
+            {
+                return att.DbContextType;
+            }
+        }
+
+        return null;
+    }
+
+    private bool dbContextMaps(Type dbContextType, Type entityType, IServiceContainer container)
+    {
+        using var nested = container.Services.CreateScope();
+        try
+        {
+            if (nested.ServiceProvider.GetService(dbContextType) is DbContext dbContext)
+            {
+                return dbContext.Model.FindEntityType(entityType) != null;
+            }
+
+            var builderType = typeof(IDbContextBuilder<>).MakeGenericType(dbContextType);
+            if (nested.ServiceProvider.GetService(builderType) is IDbContextBuilder builder)
+            {
+                return builder.BuildForMain().Model.FindEntityType(entityType) != null;
+            }
+        }
+        catch (InvalidOperationException e)
+        {
+            var logger = container.Services.GetService<ILogger<EFCorePersistenceFrameProvider>>();
+            logger?.LogError(e, "Error trying to use DbContext type {DbContextType}", dbContextType.FullNameInCode());
+        }
+
+        return false;
     }
 
     public Type DetermineDbContextType(IChain chain, IServiceContainer container)
@@ -947,6 +1086,7 @@ internal class EFCorePersistenceFrameProvider : IPersistenceFrameProvider
 
             return contextTypes
                 .Concat(abstractionTypes.Select(x => _abstractions.TryFind(x, out var concrete) ? concrete : null))
+                .Concat(entityLoadDbContextTypes(chain, container))
                 .OfType<Type>() // Removes nullability
                 .Distinct()
                 .ToArray();

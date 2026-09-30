@@ -95,6 +95,18 @@ public interface IPersistenceFrameProvider
     Type DetermineSagaIdType(Type sagaType, IChain chain, IServiceContainer container)
         => DetermineSagaIdType(sagaType, container);
 
+    /// <summary>
+    ///     The provider to build <paramref name="chain" />'s entity load and storage action frames with.
+    /// </summary>
+    /// <remarks>
+    ///     A provider that can hold one entity type in more than one store — EF Core, when two DbContexts map
+    ///     the same entity — returns a view of itself bound to the store the chain designates with
+    ///     <c>[Transactional(typeof(X))]</c> or <c>[Storage(typeof(X))]</c>. Without it, an <c>[Entity]</c> load or
+    ///     a returned <c>Storage.Update(...)</c> goes through the default store while the transactional middleware
+    ///     saves the designated one, and the change is never saved. Defaults to this provider, unchanged.
+    /// </remarks>
+    IPersistenceFrameProvider ForChain(IChain chain) => this;
+
     Frame DetermineLoadFrame(IServiceContainer container, Type sagaType, Variable sagaId);
     Frame DetermineInsertFrame(Variable saga, IServiceContainer container);
     Frame CommitUnitOfWorkFrame(Variable saga, IServiceContainer container);
